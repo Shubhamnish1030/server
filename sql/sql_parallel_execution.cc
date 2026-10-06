@@ -2434,12 +2434,13 @@ scan_exit:
   if (err == HA_ERR_END_OF_FILE)
     err= 0;
   /*
-    Ended here, on every way out, rather than after the loop: a failed
-    parallel_init_worker() -- "no chunk left" among its failures -- jumps
-    straight to this label, and the engine may already have set the scan up.
-    Ending one that was never begun is harmless.
+    parallel_init_worker() can fail after the engine has set the scan up, and
+    "no chunk left" is one of its failures. End the scan here as well as after
+    the loop, while the handler is still open: a scan left for the handler's
+    destructor is ended after close() has freed what it would restore.
+    Ending it twice is harmless.
   */
-  pwt_end_worker_scan(src);
+  src->file->parallel_end_worker();
   src->file->ha_index_or_rnd_end();
   src->file->ha_external_lock(thd, F_UNLCK);
   DBUG_RETURN(err);
@@ -2601,8 +2602,8 @@ exec_exit:
   if (err == HA_ERR_END_OF_FILE)
     err= 0;
 
-  /* Ended here, on every way out, as in the scan-only path; see there. */
-  pwt_end_worker_scan(src);
+  /* As in the scan-only path: the scan is ended here too, see there. */
+  src->file->parallel_end_worker();
 
   // end any open index/rnd scans (no-op for tables left in NONE state), unlock
   for (i= 1; i < nt; i++)

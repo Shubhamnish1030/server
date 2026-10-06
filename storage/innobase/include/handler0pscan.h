@@ -204,11 +204,9 @@ class Parallel_scan_worker
 public:
 	Parallel_scan_worker(ha_innobase *owner) : m_owner(owner) {}
 
-	/** Does not call end(): end() restores m_prebuilt, and a worker deleted
-	without being ended first is being deleted from
-	ha_innobase::parallel_scan_free(), in the handler's destructor, after
-	close() has freed m_prebuilt. close() ends any open scan itself, so that
-	path should find nothing left to delete. */
+	/** Does not call end(): the only owner that deletes a worker without
+	ending it first is ha_innobase::parallel_scan_free(), from the handler's
+	destructor, after close() has freed the m_prebuilt end() would restore. */
 	~Parallel_scan_worker() = default;
 
 	/** Take the first chunk and get ready to read it.
