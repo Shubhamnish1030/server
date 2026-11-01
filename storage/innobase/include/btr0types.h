@@ -26,6 +26,7 @@ Created 2/17/1996 Heikki Tuuri
 
 #pragma once
 
+#include "span.h"
 #include "page0types.h"
 #include "rem0types.h"
 
@@ -104,4 +105,86 @@ enum btr_latch_mode {
 	BTR_RTREE_UNDO_INS = 128,
 	/** Try to delete mark a spatial index record */
 	BTR_RTREE_DELETE_MARK = 256
+};
+
+/** Return value of btr_ra_collect() */
+enum btr_ra_result
+{
+  /* Already read full capacity */
+  BTR_RA_FULL,
+  /* Current level page was completed; sibling may continue it */
+  BTR_RA_EDGE,
+  /* Reached stop_page */
+  BTR_RA_STOP
+};
+
+/** Collector of B-tree leaf child page numbers gathered
+during a root-to-leaf descent (at PAGE_LEVEL=1), used to drive
+logical read-ahead. */
+struct btr_ra_batch
+{
+  /** Buffer receiving child page numbers; its size is the capacity */
+  const st_::span<uint32_t> pages;
+  /** number of entries filled in pages */
+  uint32_t n= 0;
+  /** PAGE_LEVEL=1 page the child numbers were collected from, or
+  0 if none (page 0 is never an index page). Used it with l1_child to
+  resume the read ahead operation */
+  uint32_t l1_page= 0;
+  /** child page number of the last node pointer collected from
+  l1_page, or 0 if none */
+  uint32_t l1_child= 0;
+
+  explicit btr_ra_batch(st_::span<uint32_t> buf) : pages(buf) {}
+
+  /** @return whether the buffer is full */
+  bool full() const { return n == pages.size(); }
+  /** @return the page numbers collected so far */
+  st_::span<const uint32_t> collected() const
+  { return st_::span<const uint32_t>(pages.data(), n); }
+  /** @return whether a level-1 page was recorded, to resume from */
+  bool resumable() const { return l1_page != 0; }
+
+  /** Read node-pointer child page numbers from a single PAGE_LEVEL=1
+  page, walking from rec in scan order. Appends to pages and updates
+  l1_child, so a later call can resume from where this one stopped by
+  re-locating that child.
+  @tparam descending  scan direction
+  @param index        index the record belongs to
+  @param rec          first node pointer to harvest
+  @param stop_page    stop right after the child with this page number;
+                      0 (never a child page) = no such page
+  @retval BTR_RA_FULL when n reached pages.size()
+  @retval BTR_RA_EDGE when the level-1 page was completely scanned
+  @retval BTR_RA_STOP when a child reached stop_page */
+  template<bool descending>
+  btr_ra_result collect(const dict_index_t *index, const rec_t *rec,
+                        uint32_t stop_page= 0) noexcept;
+
+  /** Find the record on a PAGE_LEVEL=1 page from which read-ahead
+  should resume: the node pointer following the one whose child page
+  number is 'resume_child'. The page is walked only through its
+  genuine record chain, so a concurrent reorganization
+  cannot cause an invalid read; at worst the child is not found.
+  @tparam descending   scan direction
+  @param block         PAGE_LEVEL=1 page
+  @param index         index the record belongs to
+  @param resume_child  child page number last read, or 0 to
+                       resume from the page edge
+  @return the record to resume harvesting from
+  @retval nullptr if 'resume_child' is no longer present on this page */
+  template<bool descending>
+  static const rec_t *resume_rec(const buf_block_t *block,
+                                 const dict_index_t *index,
+                                 uint32_t resume_child) noexcept;
+
+private:
+  /** @return the child page number of a node pointer record, read
+  directly from the record without rec_get_offsets() */
+  static uint32_t child_page(const dict_index_t *index,
+                             const rec_t *rec) noexcept;
+  /** @return the node pointer after rec in the scan direction;
+  nullptr if rec was the last one of the page */
+  static const rec_t *next_node_ptr(const rec_t *rec,
+                                    bool descending) noexcept;
 };

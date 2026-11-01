@@ -1092,8 +1092,151 @@ static inline void btr_ahi_inc_searches_btree(const mtr_t &mtr) noexcept
 }
 #endif /* BTR_CUR_HASH_ADAPT */
 
+#ifdef UNIV_DEBUG
+static uint32_t btr_ra_child_by_offsets(const dict_index_t *index,
+                                        const rec_t *rec) noexcept
+{
+  mem_heap_t *heap= nullptr;
+  rec_offs offsets_[REC_OFFS_NORMAL_SIZE];
+  rec_offs_init(offsets_);
+  const rec_offs *offsets= rec_get_offsets(rec, index, offsets_, 0,
+                                           ULINT_UNDEFINED, &heap);
+  const uint32_t child= btr_node_ptr_get_child_page_no(rec, offsets);
+  if (heap)
+    mem_heap_free(heap);
+  return child;
+}
+#endif
+
+uint32_t btr_ra_batch::child_page(const dict_index_t *index,
+                                  const rec_t *rec) noexcept
+{
+  ulint offs;
+  if (!index->table->not_redundant())
+    offs= rec_get_field_start_offs(rec, rec_get_n_fields_old(rec) - 1);
+  else
+  {
+    const byte *nulls= rec - (REC_N_NEW_EXTRA_BYTES + 1);
+    const byte *lens= nulls - index->n_core_null_bytes;
+    ulint null_mask= 1;
+    offs= 0;
+    const ulint n_key= dict_index_get_n_unique_in_tree_nonleaf(index);
+    for (ulint i= 0; i < n_key; i++)
+    {
+      const dict_field_t *field= dict_index_get_nth_field(index, i);
+      const dict_col_t *col= dict_field_get_col(field);
+      if (!(col->prtype & DATA_NOT_NULL))
+      {
+        if (!static_cast<byte>(null_mask))
+        {
+          nulls--;
+          null_mask= 1;
+        }
+        const bool is_null= *nulls & null_mask;
+        null_mask<<= 1;
+        if (is_null)
+          continue;
+      }
+
+      if (field->fixed_len)
+        offs+= field->fixed_len;
+      else
+      {
+        ulint len= *lens--;
+        if (len & 0x80 && DATA_BIG_COL(col))
+        {
+          len<<= 8;
+          len|= *lens--;
+          ut_ad(!(len & 0x4000));
+          len&= 0x3fff;
+        }
+        offs+= len;
+      }
+    }
+  }
+  return mach_read_from_4(rec + offs);
+}
+
+const rec_t *btr_ra_batch::next_node_ptr(const rec_t *rec,
+                                         bool descending) noexcept
+{
+  if (descending)
+  {
+    rec= page_rec_get_prev_const(rec);
+    return !rec || page_rec_is_infimum(rec) ? nullptr : rec;
+  }
+  rec= page_rec_get_next_const(rec);
+  return !rec || page_rec_is_supremum(rec) ? nullptr : rec;
+}
+
+template<bool descending>
+btr_ra_result btr_ra_batch::collect(const dict_index_t *index,
+                                    const rec_t *rec,
+                                    uint32_t stop_page) noexcept
+{
+  ut_ad(!full());
+  ut_ad(btr_page_get_level(page_align(rec)) == 1);
+
+  for (;;)
+  {
+    const uint32_t child= child_page(index, rec);
+    ut_ad(child == btr_ra_child_by_offsets(index, rec));
+    pages[n++]= child;
+    l1_child= child;
+    if (child == stop_page)
+      return BTR_RA_STOP;
+    if (full())
+      return BTR_RA_FULL;
+    if (!(rec= next_node_ptr(rec, descending)))
+      return BTR_RA_EDGE;
+  }
+}
+
+template btr_ra_result
+btr_ra_batch::collect<true>(const dict_index_t *, const rec_t *,
+                            uint32_t) noexcept;
+template btr_ra_result
+btr_ra_batch::collect<false>(const dict_index_t *, const rec_t *,
+                             uint32_t) noexcept;
+
+template<bool descending>
+const rec_t *btr_ra_batch::resume_rec(const buf_block_t *block,
+                                      const dict_index_t *index,
+                                      uint32_t resume_child) noexcept
+{
+  const page_t *page= block->page.frame;
+  ut_ad(btr_page_get_level(page) == 1);
+  const rec_t *rec= descending
+    ? page_rec_get_prev_const(page_get_supremum_rec(page))
+    : page_rec_get_next_const(page_get_infimum_rec(page));
+
+  if (!resume_child)
+    return rec;
+
+  /* Locate the last read child page from the records */
+  while (rec &&
+         !(descending ? page_rec_is_infimum(rec) : page_rec_is_supremum(rec)))
+  {
+    const uint32_t child= child_page(index, rec);
+    ut_ad(child == btr_ra_child_by_offsets(index, rec));
+    rec= descending
+      ? page_rec_get_prev_const(rec) : page_rec_get_next_const(rec);
+    if (child == resume_child)
+      return rec;
+  }
+  return nullptr;
+}
+
+template const rec_t *
+btr_ra_batch::resume_rec<true>(const buf_block_t *, const dict_index_t *,
+                               uint32_t) noexcept;
+template const rec_t *
+btr_ra_batch::resume_rec<false>(const buf_block_t *, const dict_index_t *,
+                                uint32_t) noexcept;
+
 dberr_t btr_cur_t::search_leaf(const dtuple_t *tuple, page_cur_mode_t mode,
-                               btr_latch_mode latch_mode, mtr_t *mtr)
+                               btr_latch_mode latch_mode, mtr_t *mtr,
+                               btr_ra_batch *read_ahead)
 {
   ut_ad(index()->is_btree());
 
@@ -1260,7 +1403,7 @@ dberr_t btr_cur_t::search_leaf(const dtuple_t *tuple, page_cur_mode_t mode,
 
   page_cur.block= block;
   ut_ad(block == mtr->at_savepoint(block_savepoint));
-  const bool not_first_access{block->page.touch()};
+  block->page.touch();
 #ifdef UNIV_ZIP_DEBUG
   if (const page_zip_des_t *page_zip= buf_block_get_page_zip(block))
     ut_a(page_zip_validate(page_zip, block->page.frame, index()));
@@ -1458,6 +1601,17 @@ release_tree:
   offsets= rec_get_offsets(page_cur.rec, index(), offsets, 0, ULINT_UNDEFINED,
                            &heap);
 
+  /* Logical read-ahead at PAGE_LEVEL=1, collect the child page
+  numbers that the scan is about to visit. */
+  if (read_ahead && page_level == 1 && !read_ahead->full())
+  {
+    read_ahead->l1_page= block->page.id().page_no();
+    if (mode == PAGE_CUR_L || mode == PAGE_CUR_LE)
+      read_ahead->collect<true>(index(), page_cur.rec);
+    else
+      read_ahead->collect<false>(index(), page_cur.rec);
+  }
+
   ut_ad(block == mtr->at_savepoint(block_savepoint));
 
   switch (latch_mode) {
@@ -1545,9 +1699,6 @@ release_tree:
     case BTR_SEARCH_PREV: /* btr_pcur_move_to_prev() */
       ut_ad(rw_latch == RW_S_LATCH);
 
-      if (!not_first_access)
-        buf_read_ahead_linear(page_id);
-
       if (page_has_prev(block->page.frame) &&
           page_rec_is_first(page_cur.rec, block->page.frame))
       {
@@ -1581,8 +1732,6 @@ release_tree:
     case BTR_MODIFY_LEAF:
     case BTR_SEARCH_LEAF:
       rw_latch= rw_lock_type_t(latch_mode);
-      if (!not_first_access)
-        buf_read_ahead_linear(page_id);
       break;
     case BTR_MODIFY_TREE:
       ut_ad(rw_latch == RW_X_LATCH);
@@ -1872,7 +2021,8 @@ search_loop:
 }
 
 dberr_t btr_cur_t::open_leaf(bool first, dict_index_t *index,
-                             btr_latch_mode latch_mode, mtr_t *mtr)
+                             btr_latch_mode latch_mode, mtr_t *mtr,
+                             btr_ra_batch *read_ahead)
 {
   ulint n_blocks= 0;
   mem_heap_t *heap= nullptr;
@@ -2041,13 +2191,18 @@ index_locked:
                              &heap);
     page= btr_node_ptr_get_child_page_no(page_cur.rec, offsets);
 
+    if (read_ahead && l == 1 && !read_ahead->full())
+    {
+      read_ahead->l1_page= block->page.id().page_no();
+      if (first)
+        read_ahead->collect<false>(index, page_cur.rec);
+      else
+        read_ahead->collect<true>(index, page_cur.rec);
+    }
+
     ut_ad(latch_mode != BTR_MODIFY_TREE || upper_rw_latch == RW_X_LATCH);
 
-    if (latch_mode != BTR_MODIFY_TREE)
-    {
-      if (!height && first && first_access)
-        buf_read_ahead_linear(page_id_t(block->page.id().space(), page));
-    }
+    if (latch_mode != BTR_MODIFY_TREE);
     else if (btr_cur_need_opposite_intention(block->page, index->is_clust(),
                                              lock_intention,
                                              node_ptr_max_size, compress_limit,
@@ -6459,9 +6614,9 @@ btr_copy_blob_prefix(
 	ulint	copied_len	= 0;
 	THD*	thd{current_thd};
 
-	for (mtr_t mtr{thd ? thd_to_trx(thd) : nullptr};;) {
+	for (mtr_t mtr{thd ? thd_to_trx(thd) : nullptr};;
+	     offset = FIL_PAGE_DATA) {
 		buf_block_t*	block;
-		const page_t*	page;
 		const byte*	blob_header;
 		ulint		part_len;
 		ulint		copy_len;
@@ -6470,16 +6625,14 @@ btr_copy_blob_prefix(
 
 		block = buf_page_get(id, 0, RW_S_LATCH, &mtr);
 		if (!block || btr_check_blob_fil_page_type(*block, "read")) {
+func_exit:
 			mtr.commit();
 			return copied_len;
 		}
-		if (!block->page.touch()) {
-			buf_read_ahead_linear(id);
-		}
 
-		page = buf_block_get_frame(block);
+		block->page.touch();
 
-		blob_header = page + offset;
+		blob_header= block->page.frame + offset;
 		part_len = btr_blob_get_part_len(blob_header);
 		copy_len = ut_min(part_len, len - copied_len);
 
@@ -6487,14 +6640,13 @@ btr_copy_blob_prefix(
 		       blob_header + BTR_BLOB_HDR_SIZE, copy_len);
 		copied_len += copy_len;
 
-		id.set_page_no(btr_blob_get_next_page_no(blob_header));
+		const uint32_t next{btr_blob_get_next_page_no(blob_header)};
+		if (next == FIL_NULL || copy_len != part_len) {
+			MEM_CHECK_DEFINED(buf, copied_len);
+			goto func_exit;
+		}
 
 		mtr_commit(&mtr);
-
-		if (id.page_no() == FIL_NULL || copy_len != part_len) {
-			MEM_CHECK_DEFINED(buf, copied_len);
-			return(copied_len);
-		}
 
 		/* On other BLOB pages except the first the BLOB header
 		always is at the page data start: */
@@ -6502,6 +6654,7 @@ btr_copy_blob_prefix(
 		offset = FIL_PAGE_DATA;
 
 		ut_ad(copied_len <= len);
+		id.set_page_no(next);
 	}
 }
 
