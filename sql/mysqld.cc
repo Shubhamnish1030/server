@@ -49,6 +49,7 @@
 #include "init.h"         // unireg_init
 #include "derror.h"       // init_errmessage
 #include "sql_manager.h"  // stop_handle_manager, start_handle_manager
+#include "disconnect_watcher.h"
 #include "sql_expression_cache.h" // subquery_cache_miss, subquery_cache_hit
 #include "sys_vars_shared.h"
 #include "ddl_log.h"
@@ -490,6 +491,8 @@ my_bool relay_log_recovery;
 my_bool opt_sync_frm;
 READ_ONLY_SYSVAR my_bool opt_allow_suspicious_udfs;
 my_bool opt_require_secure_transport= 0;
+/* A system variable only where there is a watcher, see sys_vars.cc */
+my_bool opt_disconnect_watcher= 1;
 READ_ONLY_SYSVAR char* opt_secure_file_priv;
 READ_ONLY_SYSVAR my_bool lower_case_file_system;
 READ_ONLY_SYSVAR my_bool opt_large_pages;
@@ -1937,6 +1940,9 @@ static void close_connections(void)
   while (CONNECT::count)
     my_sleep(100);
 
+  /* Stop reacting to client socket events, before the connections are killed */
+  disconnect_watcher_stop();
+
   /*
     First signal all threads that it's time to die
     This will give the threads some time to gracefully abort their
@@ -2144,6 +2150,7 @@ static void clean_up(bool print_message, bool use_dummy_thd)
     my_bitmap_free(&slave_error_mask);
 #endif
   stop_handle_manager();
+  disconnect_watcher_end();
   ddl_log_release();
 
   logger.cleanup_base();
@@ -5979,6 +5986,8 @@ static int init_server_components()
 
 #ifndef EMBEDDED_LIBRARY
   start_handle_manager();
+  if (disconnect_watcher_start())
+    opt_disconnect_watcher= false;
 #endif
 
   /*
@@ -6880,6 +6889,16 @@ void handle_connections_sockets()
   event_fd.events= POLLIN;
   fds.push(event_fd);
 
+  /* Client sockets that were closed or failed, see disconnect_watcher.h */
+  const int watcher_fd= disconnect_watcher_fd();
+  if (watcher_fd >= 0)
+  {
+    struct pollfd watcher_pollfd;
+    watcher_pollfd.fd= watcher_fd;
+    watcher_pollfd.events= POLLIN;
+    fds.push(watcher_pollfd);
+  }
+
   sd_notify(0, "READY=1\n"
             "STATUS=Taking your SQL requests now...\n");
 
@@ -6907,15 +6926,22 @@ void handle_connections_sockets()
     if (abort_loop)
       break;
 
+    if (watcher_fd >= 0 && (fds.at(fds.size() - 1).revents & POLLIN))
+      disconnect_watcher_process();
+
     /* Is this a new connection request ? */
-    for (size_t i= 0; i < fds.size(); ++i)
+    bool new_connection= false;
+    for (size_t i= 0; i < listen_sockets.size(); ++i)
     {
       if (fds.at(i).revents & POLLIN)
       {
         sock= listen_sockets.at(i);
+        new_connection= true;
         break;
       }
     }
+    if (!new_connection)
+      continue;
 
     for (uint retry=0; retry < MAX_ACCEPT_RETRY && !abort_loop; retry++)
     {

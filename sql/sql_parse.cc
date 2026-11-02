@@ -35,6 +35,7 @@
 #include "log.h"                                // flush_error_log
 #include "sql_view.h"         // mysql_create_view, mysql_drop_view
 #include "sql_insert.h"       // mysql_insert
+#include "disconnect_watcher.h"
 #include "sql_partition.h"    // struct partition_info
 #include "sql_db.h"           // mysql_change_db, mysql_create_db,
                               // mysql_rm_db, mysql_upgrade_db,
@@ -1653,12 +1654,27 @@ dispatch_command_return dispatch_command(enum enum_server_command command,
   */
   if (command != COM_QUERY)
     thd->reset_for_next_command();
-  thd->set_command(command);
+  /* The connection is still idle, a disconnect is only noted */
+  DEBUG_SYNC(thd, "dispatch_command_before_set_command");
+  thd->reset_kill_query();
+  /*
+    The watcher reads the command and writes the disconnect state under
+    LOCK_thd_data. A disconnect is then not lost: it is either seen here, or
+    the watcher sees the statement running and aborts it.
+  */
+  {
+    mysql_mutex_lock(&thd->LOCK_thd_data);
+    thd->set_command(command);
+    const bool client_gone= thd->disconnect_state.load() !=
+                            THD::DISCONNECT_NONE;
+    mysql_mutex_unlock(&thd->LOCK_thd_data);
+    if (client_gone)
+      thd->apply_client_disconnect();
+  }
 
   thd->enable_slow_log= true;
   thd->query_plan_flags= QPLAN_INIT;
   thd->lex->sql_command= SQLCOM_END; /* to avoid confusing VIEW detectors */
-  thd->reset_kill_query();
 
   DEBUG_SYNC(thd,"dispatch_command_before_set_time");
 
@@ -2121,6 +2137,9 @@ dispatch_command_return dispatch_command(enum enum_server_command command,
 #endif
   case COM_QUIT:
     /* Note: We don't calculate statistics for this command */
+
+    /* The client is expected to close the socket now, it is not a failure */
+    disconnect_watcher_remove(&thd->disconnect_watch, net->vio);
 
     /* Ensure that quit works even if max_mem_used is set */
     thd->variables.max_mem_used= LONGLONG_MAX;
@@ -9194,6 +9213,53 @@ THD *find_thread_by_id(longlong id, bool query_id)
 }
 
 
+#ifdef WITH_WSREP
+static bool wsrep_commit_in_progress(THD *thd)
+{
+  using trans= wsrep::transaction;
+  const auto state= thd->wsrep_trx().state();
+  return state == trans::s_preparing || state == trans::s_committing ||
+         state == trans::s_ordered_commit;
+}
+#endif
+
+
+/**
+  Abort what a thread runs, with no check of who asks. The caller owns
+  LOCK_thd_kill and LOCK_thd_data of the victim.
+
+  @param killer       the thread that kills. A kill that comes from the
+                      server, like a client disconnect, passes the victim
+  @return 0, or ER_KILL_DENIED_ERROR for a wsrep high priority thread
+*/
+
+uint kill_thd_locked(THD *killer, THD *victim, killed_state kill_signal)
+{
+  mysql_mutex_assert_owner(&victim->LOCK_thd_kill);
+  mysql_mutex_assert_owner(&victim->LOCK_thd_data);
+#ifdef WITH_WSREP
+  if (wsrep_thd_is_BF(victim, false) || victim->wsrep_applier)
+    return ER_KILL_DENIED_ERROR;
+  if (WSREP(victim))
+  {
+    /*
+      An idle connection has nothing to abort, and a commit is not aborted by
+      a disconnect. They are only marked, the next statement is aborted.
+    */
+    if (kill_signal == KILL_DISCONNECT &&
+        (victim->no_statement_running() || wsrep_commit_in_progress(victim)))
+    {
+      victim->mark_client_gone();
+      return 0;
+    }
+    return wsrep_kill_thd(killer, victim, kill_signal);
+  }
+#endif
+  victim->awake_no_mutex(kill_signal);
+  return 0;
+}
+
+
 /**
   kill one thread.
 
@@ -9225,10 +9291,10 @@ kill_one_thread(THD *thd, my_thread_id id, killed_state kill_signal, killed_type
     if ((thd->security_ctx->master_access & PRIV_KILL_OTHER_USER_PROCESS) ||
         tmp->security_ctx->priv_user_matches(thd->security_ctx))
     {
+      error= kill_thd_locked(thd, tmp, kill_signal);
 #ifdef WITH_WSREP
-      if (wsrep_thd_is_BF(tmp, false) || tmp->wsrep_applier)
+      if (error == ER_KILL_DENIED_ERROR)
       {
-        error= ER_KILL_DENIED_ERROR;
         wsrep_high_priority= true;
         push_warning_printf(thd, Sql_condition::WARN_LEVEL_NOTE,
                             ER_KILL_DENIED_ERROR,
@@ -9236,14 +9302,7 @@ kill_one_thread(THD *thd, my_thread_id id, killed_state kill_signal, killed_type
                             tmp->thread_id,
                            (tmp->wsrep_applier ? "wsrep applier" : "high priority"));
       }
-      else if (WSREP(tmp))
-        error = wsrep_kill_thd(thd, tmp, kill_signal);
-      else
-#endif /* WITH_WSREP */
-      {
-        tmp->awake_no_mutex(kill_signal);
-        error= 0;
-      }
+#endif
     }
     else
       error= (type == KILL_TYPE_QUERY ? ER_KILL_QUERY_DENIED_ERROR :

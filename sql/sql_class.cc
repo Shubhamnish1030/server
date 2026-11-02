@@ -60,6 +60,7 @@
 #include "lock.h"
 #include "wsrep_mysqld.h"
 #include "sql_connect.h"
+#include "disconnect_watcher.h"
 #include "sql_cursor.h"                         //Select_materialize
 #ifdef WITH_WSREP
 #include "wsrep_thd.h"
@@ -1821,6 +1822,7 @@ void THD::free_connection()
   my_free(const_cast<char*>(db.str));
   db= null_clex_str;
 #ifndef EMBEDDED_LIBRARY
+  DBUG_ASSERT(!disconnect_watch);               // removed by end_connection()
   if (net.vio)
     vio_delete(net.vio);
   net.vio= nullptr;
@@ -1875,6 +1877,7 @@ void THD::reset_for_reuse()
   query_name_consts= 0;                         // Safety
   abort_on_warning= 0;
   free_connection_done= 0;
+  disconnect_state= DISCONNECT_NONE;
   m_command= COM_CONNECT;
   proc_info= "login";                           // Same as in THD::THD()
   transaction->on= 1;
@@ -2131,7 +2134,26 @@ void THD::awake_no_mutex(killed_state state_to_set,
   mysql_mutex_assert_owner(&LOCK_thd_data);
   mysql_mutex_assert_owner(&LOCK_thd_kill);
 
-  print_aborted_warning(3, "KILLED");
+  if (state_to_set == KILL_DISCONNECT)
+  {
+    if (killed >= KILL_CONNECTION)              // the connection is ending
+      DBUG_VOID_RETURN;
+    /*
+      There is no statement to abort in an idle or a quitting connection. The
+      next statement is aborted when it starts, see apply_client_disconnect().
+    */
+    if (no_statement_running())
+    {
+      mark_client_gone();
+      DBUG_VOID_RETURN;
+    }
+    if (disconnect_state.load() >= DISCONNECT_ABORTING)
+      DBUG_VOID_RETURN;
+    /* The disconnect is logged if it aborts a statement, see protocol.cc */
+    disconnect_state= DISCONNECT_ABORTING;
+  }
+  else
+    print_aborted_warning(3, "KILLED");
 
   /*
     Don't degrade killed state, for example from a KILL_CONNECTION to
@@ -2165,6 +2187,35 @@ void THD::awake_no_mutex(killed_state state_to_set,
 
   abort_current_cond_wait(false);
   DBUG_VOID_RETURN;
+}
+
+/* The client is gone, and there is no statement to abort now */
+void THD::mark_client_gone()
+{
+  if (disconnect_state.load() != DISCONNECT_NONE)
+    return;
+  disconnect_state= DISCONNECT_GONE;
+  DBUG_EXECUTE_IF("disconnect_noted_idle",
+                  sql_print_information("Disconnect noted while idle: %lld",
+                                        static_cast<longlong>(thread_id)););
+}
+
+
+/*
+  A statement starts. If the client is gone, abort it. A kill that aborted
+  nothing, as the statement had finished, is applied again, the client is
+  still gone.
+*/
+void THD::apply_client_disconnect()
+{
+  mysql_mutex_lock(&LOCK_thd_kill);
+  mysql_mutex_lock(&LOCK_thd_data);
+  if (disconnect_state.load() == DISCONNECT_ABORTING)
+    disconnect_state= DISCONNECT_GONE;
+  if (disconnect_state.load() == DISCONNECT_GONE)
+    awake_no_mutex(KILL_DISCONNECT);
+  mysql_mutex_unlock(&LOCK_thd_data);
+  mysql_mutex_unlock(&LOCK_thd_kill);
 }
 
 /* Broadcast a condition to kick the target if it is waiting on it. */
@@ -2357,6 +2408,8 @@ int THD::killed_errno()
   case KILL_CONNECTION_HARD:
   case KILL_SYSTEM_THREAD:
   case KILL_SYSTEM_THREAD_HARD:
+  case KILL_DISCONNECT:
+  case KILL_DISCONNECT_HARD:
     DBUG_RETURN(ER_CONNECTION_KILLED);
   case KILL_QUERY:
   case KILL_QUERY_HARD:

@@ -21,6 +21,7 @@
 /* Classes in mysql */
 
 #include <atomic>
+#include "my_atomic_wrapper.h"
 #include <thread>
 #include "dur_prop.h"
 #include <waiting_threads.h>
@@ -689,23 +690,35 @@ enum killed_state : uint32_t
   */
   KILL_SLAVE_SAME_ID= 10,
   /*
+    The client socket was closed or failed, see disconnect_watcher.h.
+    Statement-level, like KILL QUERY. A running statement is aborted, and the
+    connection ends after its error, see Protocol::net_send_error_packet().
+    An idle connection only remembers it, and the next statement is aborted,
+    see THD::disconnect_state.
+  */
+  KILL_DISCONNECT= 12,
+  KILL_DISCONNECT_HARD= 13,
+  /*
     All of the following killed states will kill the connection
     KILL_CONNECTION must be the first of these and it must start with
     an even number (becasue of HARD bit)!
   */
-  KILL_CONNECTION= 12,
-  KILL_CONNECTION_HARD= 13,
-  KILL_SYSTEM_THREAD= 14,
-  KILL_SYSTEM_THREAD_HARD= 15,
-  KILL_SERVER= 16,
-  KILL_SERVER_HARD= 17,
+  KILL_CONNECTION= 14,
+  KILL_CONNECTION_HARD= 15,
+  KILL_SYSTEM_THREAD= 16,
+  KILL_SYSTEM_THREAD_HARD= 17,
+  KILL_SERVER= 18,
+  KILL_SERVER_HARD= 19,
   /*
     Used in threadpool to signal wait timeout.
   */
-  KILL_WAIT_TIMEOUT= 18,
-  KILL_WAIT_TIMEOUT_HARD= 19
+  KILL_WAIT_TIMEOUT= 20,
+  KILL_WAIT_TIMEOUT_HARD= 21
 
 };
+
+class THD;
+uint kill_thd_locked(THD *killer, THD *victim, killed_state kill_signal);
 
 #define killed_mask_hard(killed) ((killed_state) ((killed) & ~KILL_HARD_BIT))
 
@@ -4534,6 +4547,26 @@ public:
   bool       substitute_null_with_insert_id;
   bool	     in_lock_tables;
   bool       bootstrap, cleanup_done, free_connection_done;
+  /* Not NULL if the socket is registered in the client disconnect watcher */
+  void       *disconnect_watch= nullptr;
+  /*
+    What the disconnect watcher found out about the client, see
+    THD::awake_no_mutex() and Protocol::net_send_error_packet().
+    Written under LOCK_thd_kill and LOCK_thd_data. The owner thread alone
+    moves it to LOGGED, which is never written over, and resets it to NONE for
+    a reused THD, when nothing watches it. A statement that starts finds
+    ABORTING, if the kill aborted nothing, and treats it as GONE again.
+  */
+  enum enum_disconnect_state
+  {
+    DISCONNECT_NONE,      // the client is not known to be gone
+    DISCONNECT_GONE,      // gone while idle, applied when a statement starts
+    DISCONNECT_ABORTING,  // gone while a statement ran, it was killed
+    DISCONNECT_LOGGED     // the reason is logged, the connection is ending
+  };
+  Atomic_relaxed<enum_disconnect_state> disconnect_state{DISCONNECT_NONE};
+  void apply_client_disconnect();
+  void mark_client_gone();
 
   /**  
     is set if a statement accesses a temporary table created through
@@ -5931,6 +5964,9 @@ public:
   {
     set_query(CSET_STRING(query_arg, query_length_arg, cs_arg));
   }
+  /* An idle or a quitting connection has no statement to abort */
+  bool no_statement_running() const
+  { return get_command() == COM_SLEEP || get_command() == COM_QUIT; }
   void set_query(char *query_arg, size_t query_length_arg) /*Mutex protected*/
   {
     set_query(CSET_STRING(query_arg, query_length_arg, charset()));

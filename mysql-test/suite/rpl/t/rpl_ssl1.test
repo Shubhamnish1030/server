@@ -135,7 +135,19 @@ CHANGE MASTER TO
  master_ssl_verify_server_cert=0,
  master_ssl=1;
 connection master;
+# The session of the slave ends when the slave is gone
+--let $wait_user= replssl
+--source include/wait_until_user_sessions_end.inc
+# Without the disconnect_watcher the dump thread may still be there: a warning
+if (!$disconnect_watcher)
+{
+  disable_warnings;
+}
 drop user replssl@127.0.0.1;
+if (!$disconnect_watcher)
+{
+  enable_warnings;
+}
 connection slave;
 drop user replssl@127.0.0.1;
 
