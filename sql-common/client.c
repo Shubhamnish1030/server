@@ -1680,6 +1680,15 @@ static MYSQL_METHODS client_methods=
   cli_read_statistics,                         /* read_statistics */
   cli_read_query_result,                       /* next_result */
   cli_read_binary_rows                         /* read_rows_from_cursor */
+#else
+  ,NULL,                                       /* list_fields */
+  NULL,                                        /* read_prepare_result */
+  NULL,                                        /* stmt_execute */
+  NULL,                                        /* read_binary_rows */
+  NULL,                                        /* unbuffered_fetch */
+  NULL,                                        /* read_statistics */
+  cli_read_query_result,                       /* next_result */
+  NULL                                         /* read_rows_from_cursor */
 #endif
 };
 

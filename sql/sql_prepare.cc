@@ -6782,9 +6782,8 @@ static MYSQL_METHODS local_methods=
   loc_fetch_lengths,                           /* fetch_lengths */
   loc_flush_use_result,                        /* flush_use_result */
   NULL,                                        /* read_change_user_result */
-  loc_on_close_free                            /* on_close_free */
-#ifdef EMBEDDED_LIBRARY
-  ,NULL,                                       /* list_fields */
+  loc_on_close_free,                           /* on_close_free */
+  NULL,                                        /* list_fields */
   NULL,                                        /* read_prepare_result */
   NULL,                                        /* stmt_execute */
   NULL,                                        /* read_binary_rows */
@@ -6792,7 +6791,6 @@ static MYSQL_METHODS local_methods=
   NULL,                                        /* read_statistics */
   NULL,                                        /* next_result */
   NULL                                         /* read_rows_from_cursor */
-#endif
 };
 
 

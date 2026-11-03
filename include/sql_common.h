@@ -63,7 +63,6 @@ typedef struct st_mysql_methods
   void (*flush_use_result)(MYSQL *mysql, my_bool flush_all_results);
   int (*read_change_user_result)(MYSQL *mysql);
   void (*on_close_free)(MYSQL *mysql);
-#if !defined(MYSQL_SERVER) || defined(EMBEDDED_LIBRARY)
   MYSQL_FIELD * (*list_fields)(MYSQL *mysql);
   my_bool (*read_prepare_result)(MYSQL *mysql, MYSQL_STMT *stmt);
   int (*stmt_execute)(MYSQL_STMT *stmt);
@@ -72,7 +71,6 @@ typedef struct st_mysql_methods
   const char *(*read_statistics)(MYSQL *mysql);
   my_bool (*next_result)(MYSQL *mysql);
   int (*read_rows_from_cursor)(MYSQL_STMT *stmt);
-#endif
 } MYSQL_METHODS;
 
 #ifdef LIBMARIADB
