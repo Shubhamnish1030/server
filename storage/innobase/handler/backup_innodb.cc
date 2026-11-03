@@ -529,15 +529,32 @@ private:
         goto error_return;
 #endif
       const uint64_t end{log_sys.START_OFFSET + last_lsn - hl};
-      int f{extend(d, std::max<uint64_t>(log_sys.FILE_SIZE_MIN, end))};
+      int f{extend_log(d, end)};
       if (!f)
       {
-        const uint64_t begin= log_sys.START_OFFSET +
-          (hl == first_lsn) * (checkpoint - hl);
+        uint64_t begin= (hl == first_lsn) * (checkpoint - hl) +
+          log_sys.START_OFFSET;
+        do
+        {
 #ifdef clone_file_range
-        if (1 == (f= clone_file_range(d, s, begin, end - begin)))
+          const uint64_t align_end{end & ~uint64_t{4095}};
+          {
+            const uint64_t align_begin{begin & ~uint64_t{4095}};
+            f= clone_file_range(d, s, align_begin, align_end - align_begin);
+            switch (f) {
+            case 0:
+              begin= align_end;
+              break;
+            case 1:
+              break;
+            default:
+              continue;
+            }
+          }
 #endif
-        f= backup::copy(s, d, begin, end);
+          f= backup::copy(s, d, begin, end);
+        }
+        while (false);
         if (!f && hl == first_lsn)
           f= write_checkpoint(d, checkpoint_end_lsn - hl);
       }
