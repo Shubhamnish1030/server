@@ -972,6 +972,17 @@ static void *dbug_execute_in_new_connection(void *arg)
 			par->query, err_no, par->expect_errno);
 		_exit(1);
 	}
+	/*
+	  The rest of the statements run after mysql_query() returned. Wait
+	  for them, the server aborts a statement when the client is gone.
+	*/
+	while (mysql_more_results(par->con))
+	{
+		if (mysql_next_result(par->con) > 0)
+			break;
+		if (MYSQL_RES *res= mysql_store_result(par->con))
+			mysql_free_result(res);
+	}
 	mysql_close(par->con);
 	mysql_thread_end();
 	delete par;

@@ -4880,7 +4880,12 @@ int STDCALL mysql_next_result(MYSQL *mysql)
   mysql->affected_rows= ~(my_ulonglong) 0;
 
   if (mysql->server_status & SERVER_MORE_RESULTS_EXISTS)
+#ifdef EMBEDDED_LIBRARY
     DBUG_RETURN((*mysql->methods->next_result)(mysql));
+#else
+    /* The methods of a client in the server have no next_result */
+    DBUG_RETURN((*mysql->methods->read_query_result)(mysql));
+#endif
 
   DBUG_RETURN(-1);				/* No more results */
 }
