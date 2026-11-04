@@ -68,6 +68,8 @@ BACKUP SERVER WITH '/bin/false';
 --error ER_IO_WRITE_ERROR
 BACKUP SERVER WITH 'no-such-command';
 
+--error 0,1
+--remove_file $target_directory.empty_file
 --write_file $target_directory.empty_file
 EOF
 

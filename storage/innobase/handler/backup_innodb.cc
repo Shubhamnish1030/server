@@ -1567,7 +1567,12 @@ public:
     {
       mutex.wr_lock();
       if (ctx.state != PROCESSING || ctx.last_lsn < lsn);
-      else if (ctx.is_log_tracking())
+      else if (!ctx.is_log_tracking())
+        enqueue(log_sys.first_lsn);
+#ifdef HAVE_PMEM
+      else if (log_sys.is_mmap());
+#endif
+      else
         try {
           ut_ad(ctx.is_log_tracking(log_sys.resize_log.m_file));
           ut_ad(!ctx.is_log_tracking(log_sys.log.m_file));
@@ -1576,8 +1581,6 @@ public:
             new tracked_log{log_sys.log.m_file, lsn, file_size};
         }
         catch (std::bad_alloc&) { ctx.last_lsn= 0; }
-      else
-        enqueue(log_sys.first_lsn);
       mutex.wr_unlock();
     }
   }
