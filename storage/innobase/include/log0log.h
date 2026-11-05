@@ -476,8 +476,9 @@ public:
   static void header_write(byte *buf, lsn_t lsn, bool encrypted) noexcept;
 
   /** Rewrite the log file header in set_archive()
-  @param archive  the new value of innodb_log_archive */
-  void header_rewrite(my_bool archive) noexcept;
+  @param archive  the new value of innodb_log_archive
+  @param lsn      get_lsn() */
+  void header_rewrite(my_bool archive, lsn_t lsn) noexcept;
 
   /** @return an estimate of get_lsn(),
   using acquire-release ordering with write_buf() or persist();
